@@ -14,68 +14,134 @@
 # * SPDX-License-Identifier: EPL-2.0 OR GPL-2.0 WITH Classpath-exception-2.0
 # ********************************************************************************
 
-"""Statevector-based evaluation of single-qubit Z expectations."""
+"""Jasp evaluation of local Pauli expectation values."""
 
+from collections.abc import Callable
+
+import jax.numpy as jnp
 import numpy as np
 
-from qrisp import QuantumVariable
+from qrisp import QuantumVariable, h, s, s_dg
+from qrisp.algorithms.qml._primitives import assert_condition_p, expectation_z_p
 from qrisp.jasp import TracingModeError, TracingQuantumSession
+from qrisp.operators.qubit import X, Y, Z
 
 
-def expectation_z(qv: QuantumVariable) -> float:
-    """Compute the Pauli Z expectation of a prepared single-qubit register.
+def expectation_pauli(
+    qv: QuantumVariable,
+    *,
+    observable: Callable | tuple[Callable, ...] = Z,
+    qubit_index: int | tuple[int, ...] = 0,
+) -> dict:
+    r"""Compute analytic local Pauli expectations while preserving the register state.
 
     Parameters
     ----------
     qv : QuantumVariable
-        A live register containing the only qubit in its session. State
-        preparation must use unitary operations and have no open environments.
+        Live register in the active Jasp program.
+    observable : callable or tuple of callables, optional
+        ``X``, ``Y`` or ``Z`` from ``qrisp.operators.qubit``, or a non-empty tuple
+        of these. The selection must be known at tracing time. The default is ``Z``.
+    qubit_index : int or tuple of int, optional
+        Qubit index or non-empty tuple of indices, known at tracing time. The default is 0.
 
     Returns
     -------
-    float
-        The expectation P(0) - P(1), computed without shot sampling and subject
-        to the numerical precision of Qrisp's statevector simulator.
-
-    Raises
-    ------
-    TracingModeError
-        If the register belongs to a Jasp tracing session.
-    ValueError
-        If the register or its circuit does not satisfy the restrictions above.
+    dict
+        ``values`` is a 2D JAX array with one row per qubit and one column per
+        observable. The tuples ``qubit_indices`` and ``observables`` label the axes
+        in the requested order, including repeats. Return the numeric values
+        from functions passed to ``jaspify`` or ``qjit``.
 
     Examples
     --------
-    Prepare RY(theta)|0> and compare its Z expectation with cos(theta).
-
-    >>> import numpy as np
-    >>> from qrisp import QuantumVariable, ry
-    >>> from qrisp.algorithms.qml.execution import expectation_z
-    >>> theta = 0.37
-    >>> qv = QuantumVariable(1)
-    >>> ry(theta, qv[0])
-    >>> result = expectation_z(qv)
-    >>> bool(np.isclose(result, np.cos(theta), atol=1e-6, rtol=0))
-    True
+    >>> from qrisp.algorithms.qml.execution import expectation_pauli
+    >>> from qrisp.algorithms.qml.templates import prepare_rotation
+    >>> from qrisp.jasp import jaspify
+    >>> @jaspify
+    ... def readout(theta):
+    ...     qv = prepare_rotation(theta)
+    ...     return expectation_pauli(qv)["values"][0, 0]
 
     """
-    if isinstance(qv.qs, TracingQuantumSession):
-        raise TracingModeError("expectation_z only supports eager execution")
-    if qv.size != 1:
-        raise ValueError("expectation_z requires a single-qubit register")
-    if qv.is_deleted():
+    if not isinstance(qv, QuantumVariable):
+        raise TypeError("qv must be a QuantumVariable")
+
+    qs = TracingQuantumSession.get_instance()
+    if qs.abs_qst is None or qv.qs is not qs:
+        raise TracingModeError("Use expectation_pauli inside jaspify or qrisp.jasp.qjit with a tracing register")
+
+    observables = observable if isinstance(observable, tuple) else (observable,)
+    if not observables:
+        raise ValueError("observable must contain at least one Pauli constructor")
+
+    for pauli in observables:
+        if not any(pauli is constructor for constructor in (X, Y, Z)):
+            raise TypeError("observable must be X, Y, Z or a tuple of these Qrisp constructors")
+
+    indices = _normalize_qubit_indices(qubit_index)
+
+    qs._check_in_scope()
+
+    if any(deleted_qv is qv for deleted_qv in qs.deleted_qv_list):
         raise ValueError("Cannot evaluate a deleted QuantumVariable")
-    if qv.qs.env_stack:
-        raise ValueError("Close all quantum environments before evaluating expectation_z")
-    if list(qv.reg) != list(qv.qs.qubits):
-        raise ValueError("The register must contain the only qubit in its session")
 
-    # Expand composite gates so that non-unitary operations are also checked.
-    qc = qv.qs.transpile()
-    for instruction in qc.data:
-        if instruction.op.name in ("measure", "reset", "qb_dealloc") or instruction.clbits:
-            raise ValueError("expectation_z does not support measurements, resets or qubit reuse")
+    if X in observables or Y in observables:
+        # Check bounds before applying the first basis-change gate.
+        qs.abs_qst = assert_condition_p.bind(
+            qv.size > max(indices),
+            qs.abs_qst,
+            message="qubit_index must satisfy 0 <= index < qv.size",
+        )
 
-    statevector = qc.statevector_array()
-    probabilities = np.abs(statevector) ** 2
-    return float(probabilities[0] - probabilities[1])
+    # Read each observable once, then reuse its column if it appears again.
+    columns = {}
+    for pauli in dict.fromkeys(observables):
+        columns[pauli] = _expectation_column(qv, pauli, indices)
+    return {
+        "values": jnp.stack([columns[pauli] for pauli in observables], axis=1),
+        "qubit_indices": indices,
+        "observables": tuple(pauli.__name__ for pauli in observables),
+    }
+
+
+def _normalize_qubit_indices(qubit_index: int | tuple[int, ...]) -> tuple[int, ...]:
+    """Return static indices as Python integers for the Jasp primitive."""
+    if qubit_index is None:
+        raise TracingModeError("Specify explicit qubit indices for expectation_pauli in Jasp")
+
+    indices = qubit_index if isinstance(qubit_index, tuple) else (qubit_index,)
+    for index in indices:
+        if not isinstance(index, (int, np.integer)):
+            raise TypeError("qubit_index must contain Python or NumPy integer scalars")
+
+    if not indices or any(index < 0 for index in indices):
+        raise ValueError("qubit_index must select at least one index with 0 <= index < qv.size")
+
+    return tuple(int(index) for index in indices)
+
+
+def _expectation_column(qv, pauli, indices):
+    """Evaluate one local Pauli observable on the requested qubits."""
+    # The primitive reads Z directly. For X, apply H first. For Y, apply S-dagger then H.
+    if pauli is Z:
+        return _expectation_z(qv, indices)
+
+    values = {}
+    for index in dict.fromkeys(indices):
+        # Restore the basis after each readout because distinct indices can alias the same qubit.
+        qubit = qv[index]
+        if pauli is Y:
+            s_dg(qubit)
+        h(qubit)
+        values[index] = _expectation_z(qv, (index,))[0]
+        h(qubit)
+        if pauli is Y:
+            s(qubit)
+    return jnp.stack([values[index] for index in indices])
+
+
+def _expectation_z(qv, indices):
+    """Record an analytic Z readout and update the traced quantum state."""
+    values, qv.qs.abs_qst = expectation_z_p.bind(qv.reg.tracer, qv.qs.abs_qst, qubit_indices=indices)
+    return values
