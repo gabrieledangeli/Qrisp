@@ -203,6 +203,17 @@ Other New Features
   fully understand and take responsibility for the changes implemented
   (`PR #816 <https://github.com/eclipse-qrisp/Qrisp/pull/816>`_).
 
+- **Semiclassical order finding for Shor's algorithm**
+  :func:`~qrisp.shor.semiclassical_order_finding` runs the quantum part of
+  order finding in Jasp mode with a single control qubit, measured after every
+  step of the phase estimation, instead of a phase register of ``2n`` qubits
+  followed by the inverse QFT. The outcome has the same distribution, while the
+  circuit needs ``2n - 1`` fewer qubits (``3n + 2 ceil(log2 n) + 2`` with the
+  default adder) and ``2n`` single-qubit rotations instead of the controlled
+  phase gates of the inverse QFT. The resource estimators count the circuit
+  without simulating it
+  (`PR #932 <https://github.com/eclipse-qrisp/Qrisp/pull/932>`_).
+
 .. Add other new features above this line
 
 Bug Fixes
@@ -536,6 +547,20 @@ Bug Fixes
   raises a ``TypeError``
   (`PR #918 <https://github.com/eclipse-qrisp/Qrisp/pull/918>`_).
 
+* :ref:`IQPE <IQPE>` applied the powers ``U**(2**t)``, ..., ``U**2`` of the
+  unitary instead of ``U**(2**(t - 1))``, ..., ``U``, where ``t`` is the
+  precision. It therefore returned twice the phase modulo 1 and lost its most
+  significant bit: a phase of 0.75 was estimated as 0.5. It now returns the
+  phase, as documented, so code that relied on the previous values (twice the
+  phase) needs to be updated
+  (`PR #932 <https://github.com/eclipse-qrisp/Qrisp/pull/932>`_).
+
+* :ref:`IQPE <IQPE>` released its control qubit after measuring it, without
+  resetting it. Interpreters that reuse released qubits, such as the Catalyst
+  interpreter, could therefore start the next step with the qubit in ``|1>`` and
+  give a wrong estimate. The control qubit is now reset before it is released
+  (`PR #932 <https://github.com/eclipse-qrisp/Qrisp/pull/932>`_).
+
 * Fixed simulation of composite operations in :meth:`~qrisp.QuantumCircuit.statevector_array`
   and :meth:`~qrisp.QuantumCircuit.run`: circuits now transpile composite operations before
   simulation to avoid computing wide unitary matrices, while preserving narrow controlled
@@ -546,13 +571,13 @@ Bug Fixes
   (`PR #975 <https://github.com/eclipse-qrisp/Qrisp/pull/975>`_).
 
 * Fixed a bug in ``resolve_naming_collisions`` where in the "qv_0 is newer" conditional branch,
-  ``qv_1.is_fixed_name`` (called ``user_given_name`` earlier) was checked 
+  ``qv_1.is_fixed_name`` (called ``user_given_name`` earlier) was checked
   when it should have been ``qv_0``'s.
-  As a result, merging two sessions could rename a variable with 
+  As a result, merging two sessions could rename a variable with
   an explicitly given (fixed) name. Now a fixed name is never renamed.
   (`PR #882 <https://github.com/eclipse-qrisp/Qrisp/pull/882>`_).
 
-* Fixed a bug where calls of :meth:`~qrisp.QuantumVariable.duplicate` of the form ``duplicate(name="foo*")`` 
+* Fixed a bug where calls of :meth:`~qrisp.QuantumVariable.duplicate` of the form ``duplicate(name="foo*")``
   caused the variable being duplicated to change.
   There, ``self.is_fixed_name`` (called ``user_given_name`` earlier) was set to ``False``, instead of the duplicate's ``is_fixed_name``.
   This is fixed now.
@@ -582,6 +607,19 @@ Bug Fixes
 * Fixed ``reset`` on a single qubit, such as ``reset(qv[0])``, failing to
   compile with :ref:`qjit <qjit>`. Resetting a whole QuantumVariable was not
   affected (`PR #941 <https://github.com/eclipse-qrisp/Qrisp/pull/941>`_).
+* Fixed the matrices of several standard gates and their conversions:
+
+  - ``RGate(theta, phi)`` now implements ``RZ(phi) RX(theta) RZ(-phi)``,
+    matching the standard R gate. Its PennyLane conversion is now
+    ``qml.Rot(pi/2 - phi, theta, phi - pi/2)``.
+  - ``SXGate`` and ``SXDGGate`` now carry the global phase ``±pi/4``, so they
+    are the exact square roots of ``X`` instead of ``RX(±pi/2)``. This phase is
+    also kept when they are controlled. They are now converted to ``qml.SX``
+    in PennyLane.
+  - ``U1Gate`` now converts to Qiskit's ``RZGate`` instead of ``PhaseGate``,
+    since Qrisp's ``U1`` is an RZ rotation.
+
+  (`PR #949 <https://github.com/eclipse-qrisp/Qrisp/pull/949>`_).
 
 Compatibility
 -------------
@@ -597,10 +635,40 @@ Compatibility
   generic ``Exception``. Code using ``except Exception:`` is unaffected
   (`PR #846 <https://github.com/eclipse-qrisp/Qrisp/pull/846>`_).
 
+* :ref:`IQPE <IQPE>` returns the phase instead of twice the phase modulo 1
+  (see Bug Fixes). It raises a ``TypeError`` for a precision that is not an
+  integer and, unless the precision is traced, a ``ValueError`` for a precision
+  above 63, for which the number of calls of the unitary overflowed a 64-bit
+  integer
+  (`PR #932 <https://github.com/eclipse-qrisp/Qrisp/pull/932>`_).
+
+* Qrisp now supports SymPy 1.14. Multi-``QuantumVariable`` statevectors are
+  built with ``TensorProduct``, which SymPy 1.14 requires, and the dependency
+  bound is now ``sympy>=1.13,<1.15``
+  (`PR #590 <https://github.com/eclipse-qrisp/Qrisp/pull/590>`_).
+* ``RGate`` and ``QuantumCircuit.r`` are deprecated in favor of the identical
+  ``PRXGate`` and the new ``QuantumCircuit.prx``. Both still work but emit a
+  ``QrispDeprecationWarning``. ``RGate(theta, phi)`` now builds a
+  ``PRXGate(theta, phi)``, so the resulting operation is named ``"prx"`` instead
+  of ``"r"`` and stores its angles as ``alpha`` and ``beta``. ``PRXGate`` can now
+  also be imported from ``qrisp.circuit.standard_operations``
+  (`PR #949 <https://github.com/eclipse-qrisp/Qrisp/pull/949>`_).
+
 .. Add compatibility notes above this line
 
 New Tutorials/ Updated Documentation
 -------------------------------------
+
+* Updated the :doc:`BigInteger tutorial </general/tutorial/BigInteger>`, which
+  compiles the order-finding circuit of Shor's algorithm and counts its gates up
+  to 2048 bits. The parallel resource estimation now draws odd moduli with a
+  coprime base, uses BigIntegers wide enough for the products before their
+  reduction, and passes precomputed multipliers and inverses to the in-place
+  multiplication. The 2048-bit counts are therefore correct, and they take
+  minutes instead of hours. The tutorial also counts the peak number of qubits,
+  on the first multiplication, which reaches the peak of the whole circuit. The
+  operator examples no longer overflow, and the code uses explicit imports
+  (`PR #1002 <https://github.com/eclipse-qrisp/Qrisp/pull/1002>`_).
 
 * :doc:`CUDA-Q tutorial </general/tutorial/CUDAQ>` - Compiling and running
   Qrisp kernels on NVIDIA's CUDA-Q platform, from a Bell-state example to
@@ -625,6 +693,13 @@ New Tutorials/ Updated Documentation
 
 API Changes
 -----------
+
+* The PyTket converter has been removed in this release: the
+  ``qrisp.interface.converter.pytket_converter`` module and its exports,
+  the ``pytket`` optional dependency, and the associated tests and
+  documentation are gone. :meth:`~qrisp.QuantumCircuit.to_pytket` is kept
+  only as a stub that raises ``NotImplementedError``
+  (`PR #662 <https://github.com/eclipse-qrisp/Qrisp/pull/662>`_).
 
 * :class:`~qrisp.interface.IQMBackend` is now a delegation shim that
   re-exports ``IQMBackend`` from ``iqm.qrisp_iqm`` (IQM client).
