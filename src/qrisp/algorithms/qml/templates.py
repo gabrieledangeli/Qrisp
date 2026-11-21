@@ -60,20 +60,28 @@ def prepare_rotation(
     ...     return measure(qv[0])
 
     """
+    # Jasp needs an active session to record the gates.
     qs = TracingQuantumSession.get_instance()
     if qs.abs_qst is None or not check_for_tracing_mode():
         raise TracingModeError("Use prepare_rotation inside jaspify or qrisp.jasp.qjit")
+    
+    # Check that the quantum state belongs to the current JAX trace.
     qs._check_in_scope()
 
     if not any(rotation is gate for gate in (rx, ry, rz)):
         raise TypeError("rotation must be one of the Qrisp functions rx, ry or rz")
 
+    # Put even a single angle in a list so we can loop over it.
     angles = _normalize_angles(angle)
+
     if qv is None:
+        # Start with one qubit in |0> for each angle.
         qv = QuantumVariable(len(angles))
     else:
+        # To reuse a register, check that it belongs to this trace and has one qubit per angle.
         _check_rotation_register(qv, qs, len(angles))
 
+    # The first angle rotates qubit 0, the second rotates qubit 1, and so on.
     for index, value in enumerate(angles):
         rotation(value, qv[index])
     return qv
@@ -81,36 +89,50 @@ def prepare_rotation(
 
 def _normalize_angles(angle):
     """Collect one scalar per qubit, preserving traced angle values."""
-    is_vector = isinstance(angle, NDArrayLike) and angle.ndim == 1
-    values = angle if is_vector or isinstance(angle, (list, tuple)) else (angle,)
     shape_error = "angle must be a scalar or a non-empty one-dimensional sequence"
 
+    # A single angle goes through the same loop as a sequence of angles.
+    is_vector = isinstance(angle, NDArrayLike) and angle.ndim == 1
+    if is_vector or isinstance(angle, (list, tuple)):
+        items = angle
+    else:
+        items = (angle,)
+
     angles = []
-    for item in values:
-        # Indexing with () reads a scalar from a 0D array and keeps traced angles in JAX.
-        value = item[()] if isinstance(item, NDArrayLike) and item.ndim == 0 else item
+    for value in items:
+        if isinstance(value, NDArrayLike) and value.ndim == 0:
+            # Read the scalar in a way JAX can trace.
+            value = value[()]
+
+        # Each qubit gets one angle, so reject nested inputs like [[a, b]].
         is_nested_array = isinstance(value, NDArrayLike) and value.ndim != 0
         if isinstance(value, (list, tuple)) or is_nested_array:
             raise ValueError(shape_error)
         angles.append(value)
 
+    # A rotation needs at least one angle.
     if not angles:
         raise ValueError(shape_error)
     return angles
 
 
 def _check_rotation_register(qv: QuantumVariable, qs: TracingQuantumSession, num_angles: int) -> None:
-    """Check the supplied register before applying any gates."""
+    """Check that the register can be reused for one rotation per qubit."""
     if not isinstance(qv, QuantumVariable):
         raise TypeError("qv must be a QuantumVariable or None")
 
-    # Nested Jasp traces share the same session.
-    if qv.qs is not qs or qv.reg.tracer._trace is not qs.abs_qst._trace:
+    # Nested traces share a session, so check both the session and the trace.
+    belongs_to_active_trace = qv.qs is qs and qv.reg.tracer._trace is qs.abs_qst._trace
+    if not belongs_to_active_trace:
         raise TracingModeError("qv must belong to the active Jasp trace")
+
+    # Use identity here because "=="" compares the quantum values.
     if any(deleted_qv is qv for deleted_qv in qs.deleted_qv_list):
         raise ValueError("Cannot apply rotations to a deleted QuantumVariable")
 
-    # The register size can depend on a runtime argument.
+    # The size may only be known at runtime. Record the check before the rotations.
     qs.abs_qst = assert_condition_p.bind(
-        qv.size == num_angles, qs.abs_qst, message="The number of angles must match qv.size"
+        qv.size == num_angles,
+        qs.abs_qst,
+        message="The number of angles must match qv.size",
     )
